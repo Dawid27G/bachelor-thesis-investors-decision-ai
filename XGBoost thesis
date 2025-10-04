@@ -1,0 +1,97 @@
+import pandas as pd
+import yfinance as yf
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from xgboost import XGBClassifier
+import numpy as np
+df = yf.download("TSLA", start="2021-01-01", end="2024-12-31")
+df.reset_index(inplace=True)
+df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+df.dropna(inplace=True)
+sentiment = pd.read_csv("C:/Users/Micron/Desktop/danetesla/dzienny_czyszczony_finbert_wartoscmax.csv")
+sentiment["Date"] = pd.to_datetime(sentiment["date"])
+weights = [0.5, 0.3, 0.2]
+sentiment["sentiment_score_wavg"] = sentiment["sentiment_score"].rolling(3).apply(
+    lambda x: (x * weights).sum(), raw=True).fillna(0)
+sentiment["sentiment_score"] = sentiment["sentiment_score"].replace(0, pd.NA)
+sentiment["sentiment_score"] = sentiment["sentiment_score"].fillna(method="ffill")
+df["sentiment_score_wavg"] = df["Date"].map(dict(zip(sentiment["Date"], sentiment["sentiment_score_wavg"]))).fillna(0)
+if "news_count" in sentiment.columns:
+    df["news_count"] = df["Date"].map(dict(zip(sentiment["Date"], sentiment["news_count"]))).fillna(0)
+else:
+    df["news_count"] = 0
+nasdaq100 = yf.download("^NDX", start="2021-01-01", end="2024-12-31")
+nasdaq100["nasdaq_return100"] = nasdaq100["Close"].pct_change()
+nasdaq100_map = dict(zip(nasdaq100.index.date, nasdaq100["nasdaq_return100"]))
+df["nasdaq_return100"] = df["Date"].dt.date.map(nasdaq100_map).fillna(0)
+df["nasdaq_return100_roll3"] = df["nasdaq_return100"].rolling(window=3).mean()
+close = df["Close"].squeeze()
+high = df["High"].squeeze()
+low = df["Low"].squeeze()
+df["rsi"] = RSIIndicator(close=close, window=14).rsi()
+df["macd"] = MACD(close=close).macd()
+df["ema_10"] = EMAIndicator(close=close, window=10).ema_indicator()
+df["ema_50"] = EMAIndicator(close=close, window=50).ema_indicator()
+df["stoch"] = StochasticOscillator(high=high, low=low, close=close).stoch()
+bb = BollingerBands(close=close)
+df["bb_bbm"] = bb.bollinger_mavg()
+df["bb_bbh"] = bb.bollinger_hband()
+df["bb_bbl"] = bb.bollinger_lband()
+for col in ["rsi", "macd", "ema_10", "ema_50", "stoch"]:
+    df[f"{col}_roll3"] = df[col].rolling(3).mean()
+df["daily_range"] = df["High"] - df["Low"]
+df["range_pct"] = (df["High"] - df["Low"]) / df["Open"]
+df["return_1d"] = df["Close"].pct_change(1)
+df["return_3d"] = df["Close"].pct_change(3)
+df["return_5d"] = df["Close"].pct_change(5)
+df.dropna(inplace=True)
+horizons = [ 10, 20, 30]
+thresholds = [0.01, 0.0125, 0.015, 0.0175, 0.02, 0.0225, 0.025, 0.0275, 0.03, 0.0325, 0.035, 0.0375, 0.04, 0.0425, 0.045, 0.0475, 0.05, 0.0525, 0.055, 0.0575, 0.06, 0.0625, 0.065, 0.0675, 0.07, 0.0725, 0.075, 0.0775, 0.08, 0.0825, 0.085, 0.0875, 0.08, 0.0825, 0.085, 0.0875, 0.09, 0.0925, 0.095, 0.0975, 0.1, 0.1025, 0.105, 0.1075, 0.12, 0.1225, 0.125, 0.1275, 0.13, 0.1325, 0.135, 0.1375, 0.14, 0.1425, 0.145, 0.1475, 0.15]
+for horizon in horizons:
+    df[f"return_{horizon}d_future"] = (df["Close"].shift(-horizon) - df["Close"]) / df["Close"]
+    for threshold in thresholds:
+        print(f"\n=== HORYZONT: {horizon} dni | THRESHOLD: ±{threshold} ===")
+        def label_class(x):
+            if x > threshold:
+                return 1
+            elif x < -threshold:
+                return -1
+            else:
+                return 0
+        df["decision"] = df[f"return_{horizon}d_future"].apply(label_class)
+        df_model = df.dropna()
+        print("Rozkład klas:", df_model["decision"].value_counts().to_dict())
+        features = [
+            "rsi", "macd", "ema_10", "ema_50", "stoch",
+            "rsi_roll3", "macd_roll3", "ema_10_roll3", "ema_50_roll3", "stoch_roll3",
+            "bb_bbm", "bb_bbh", "bb_bbl",
+            "daily_range", "range_pct",
+            "return_1d", "return_3d", "return_5d",
+            "sentiment_score_wavg",
+            "nasdaq_return100", "nasdaq_return100_roll3"
+        ]
+        X = df_model[features].apply(pd.to_numeric, errors='coerce')
+        y = df_model["decision"]
+        X.dropna(inplace=True)
+        y = y.loc[X.index]
+        y_encoded = y.replace({-1: 0, 0: 1, 1: 2})  # 3 klasy: 0, 1, 2
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_encoded, stratify=y_encoded, test_size=0.2, random_state=42
+        )
+        model = XGBClassifier(
+            objective='multi:softprob',
+            num_class=3,
+            use_label_encoder=False,
+            eval_metric='mlogloss',
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_test_decoded = y_test.replace({0: -1, 1: 0, 2: 1})
+        y_pred_decoded = pd.Series(y_pred).replace({0: -1, 1: 0, 2: 1})
+        print(classification_report(y_test_decoded, y_pred_decoded, zero_division=0)) 
+
+        

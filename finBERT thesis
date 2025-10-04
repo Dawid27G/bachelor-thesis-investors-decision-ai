@@ -1,0 +1,110 @@
+from gnews import GNews
+import pandas as pd
+from datetime import datetime, timedelta
+import string
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+
+# === Inicjalizacja FinBERT ===
+tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+finbert = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+
+# === Konfiguracja GNews ===
+google_news = GNews(language='en', country='US', max_results=50)
+start_date = datetime(2021, 1, 1)
+end_date = datetime(2025, 1, 1)
+results = []
+
+# === Czyszczenie tekstu
+stop_words = {
+    'a', 'an', 'the', 'and', 'or', 'but', 'if', 'then', 'else', 'this', 'that',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'of', 'at', 'on', 'in',
+    'to', 'for', 'with', 'about', 'by', 'from', 'as', 'into', 'like', 'through',
+    'over', 'after', 'before', 'between', 'up', 'down', 'out', 'off', 'again',
+    'further', 'once', 'here', 'there', 'when', 'where', 'why', 'how',
+    'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such',
+    'only', 'own', 'same', 'so', 'than', 'too', 'very', 'can', 'will', 'just',
+    'should', 'now', 'i', 'you', 'he', 'she', 'we', 'they', 'me', 'him', 'her',
+    'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their', 'mine', 'yours',
+    'hers', 'ours', 'theirs', 'am', 'do', 'does', 'did', 'having', 'have', 'has',
+    'would', 'could', 'might', 'must', 'shall', 'may',
+    "i'm", "you're", "he's", "she's", "we're", "they're", "i've", "you've",
+    "we've", "they've", "i'd", "you'd", "he'd", "she'd", "we'd", "they'd",
+    "i'll", "you'll", "he'll", "she'll", "we'll", "they'll",
+    "it's", "that's", "there's", "what's", "who's", "let's",
+    "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't",
+    "hasn't", "haven't", "hadn't", "won't", "wouldn't", "can't", "couldn't",
+    "mustn't", "shouldn't", "mightn't", "needn't"
+}
+def clean_text(text):
+    if not text:
+        return ''
+    text = text.lower()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    words = text.split()
+    words = [word for word in words if word not in stop_words]
+    return ' '.join(words)
+
+# === Przypisanie wartości liczbowych do etykiet
+label_map = {"positive": 1, "neutral": 0, "negative": -1}
+
+# === Iteracja po dniach
+current = start_date
+while current <= end_date:
+    next_day = current + timedelta(days=1)
+    query = f"Tesla after:{current.date()} before:{next_day.date()}"
+
+    try:
+        articles = google_news.get_news(query)
+        seen_titles = set()
+        sentiment_scores = []
+
+        for article in articles:
+            title = article['title']
+            if title in seen_titles:
+                continue  # pomiń duplikat
+            seen_titles.add(title)
+
+            desc = article.get('description', '')
+            cleaned_title = clean_text(title)
+            cleaned_desc = clean_text(desc)
+
+            try:
+                # analiza tytułu (waga 0.6)
+                title_pred = finbert(cleaned_title)[0]
+                title_score = label_map.get(title_pred['label'].lower(), 0) * title_pred['score']
+
+                # analiza opisu (waga 0.4), jeśli istnieje
+                if cleaned_desc:
+                    desc_pred = finbert(cleaned_desc)[0]
+                    desc_score = label_map.get(desc_pred['label'].lower(), 0) * desc_pred['score']
+                else:
+                    desc_score = 0
+
+                weighted_score = round(0.6 * title_score + 0.4 * desc_score, 4)
+                sentiment_scores.append(weighted_score)
+
+            except Exception as err:
+                print(f"Błąd predykcji: {err}")
+
+        avg_sentiment = round(sum(sentiment_scores) / len(sentiment_scores), 4) if sentiment_scores else 0
+        news_count = len(sentiment_scores)
+
+        results.append({
+            'date': current.date(),
+            'sentiment_score': avg_sentiment,
+            'news_count': news_count
+        })
+
+        print(f"{current.date()} | Newsów (unikalnych): {news_count} | Średni sentyment: {avg_sentiment}")
+
+    except Exception as e:
+        print(f"Błąd dla dnia {current.date()} | {str(e)}")
+
+    current += timedelta(days=1)
+
+# === Zapis
+df = pd.DataFrame(results)
+print("\n=== PODSUMOWANIE ===")
+print(df)
+df.to_csv("dzienny_czyszczony_finbert_wartoscmax.csv", index=False)
